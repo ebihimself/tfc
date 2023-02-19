@@ -1,98 +1,85 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 )
 
 var pullCmd = &cobra.Command{
-	Use:   "pull",
-	Short: "Download the Terraform state for a workspace by name",
+	Use:   "pull [workspace name]",
+	Short: "Pull the Terraform state file for a workspace",
+	Long:  "Pull the Terraform state file for a workspace.",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Get workspace ID from .workspaces file
 		workspaceName := args[0]
-
-		// Load existing workspaces
-		workspaces, err := loadWorkspaces()
+		workspaceID, err := getWorkspaceIDByName(workspaceName)
 		if err != nil {
 			return err
 		}
 
-		// Find workspace by name
-		var workspaceID string
-		for _, w := range workspaces {
-			if w.Name == workspaceName {
-				workspaceID = w.WorkspaceID
-				break
-			}
-		}
-		if workspaceID == "" {
-			return fmt.Errorf("workspace with the name %s not found", workspaceName)
+		// Acquire workspace lock
+		_, err = acquireWorkspaceLock(workspaceID)
+		if err != nil {
+			return err
 		}
 
-		// Download the Terraform state for the specified workspace
+		// Download Terraform state file
 		tfcToken, ok := os.LookupEnv("TFC_TOKEN")
 		if !ok {
 			return fmt.Errorf("TFC_TOKEN environment variable is not set")
 		}
-		if err := downloadTerraformState(workspaceID, tfcToken); err != nil {
+		err = downloadTerraformState(workspaceID, tfcToken)
+		if err != nil {
 			return err
 		}
 
-		fmt.Println("Terraform state downloaded successfully.")
+		// Print success message
+		fmt.Printf("Successfully pulled Terraform state file for workspace %s (ID %s)\n", workspaceName, workspaceID)
 
 		return nil
 	},
 }
 
-func downloadTerraformState(workspaceID, tfcToken string) error {
-	// Get the hosted state download URL from the Terraform API
-	apiURL := fmt.Sprintf("https://app.terraform.io/api/v2/workspaces/%s/current-state-version", workspaceID)
-	req, err := http.NewRequest("GET", apiURL, nil)
+func init() {
+	rootCmd.AddCommand(pullCmd)
+}
+
+func downloadTerraformState(workspaceID string, tfcToken string) error {
+	// Get download URL for current state version
+	downloadURL, err := getCurrentStateDownloadURL(workspaceID, tfcToken)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+tfcToken)
-	req.Header.Set("Content-Type", "application/vnd.api+json")
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP request failed with status code %d", resp.StatusCode)
-	}
-
-	// Parse the hosted state download URL from the Terraform API response
-	var data map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return err
-	}
-	url, ok := data["data"].(map[string]interface{})["attributes"].(map[string]interface{})["hosted-state-download-url"].(string)
-	if !ok {
-		return fmt.Errorf("Failed to parse hosted state download URL from API response")
-	}
-
-	// Download the Terraform state file
-	resp, err = http.Get(url)
+	// Download state file
+	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	file, err := os.Create("state.tfstate")
+	// Create output file
+	filename := "state.tfstate"
+	err = os.MkdirAll(filepath.Dir(filename), 0755)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	out, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
 
-	_, err = io.Copy(file, resp.Body)
+	// Write state file to output
+	_, err = io.Copy(out, resp.Body)
 	if err != nil {
 		return err
 	}
@@ -100,6 +87,37 @@ func downloadTerraformState(workspaceID, tfcToken string) error {
 	return nil
 }
 
-func init() {
-	rootCmd.AddCommand(pullCmd)
+func getCurrentStateDownloadURL(workspaceID string, tfcToken string) (string, error) {
+	url := fmt.Sprintf("https://app.terraform.io/api/v2/workspaces/%s/current-state-version", workspaceID)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Add("Authorization", "Bearer "+tfcToken)
+	req.Header.Add("Content-Type", "application/vnd.api+json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("failed to get current state version for workspace %s (status code %d)", workspaceID, resp.StatusCode)
+	}
+
+	var stateVersionData map[string]interface{}
+	stateVersionBody, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	err = json.Unmarshal(stateVersionBody, &stateVersionData)
+	if err != nil {
+		return "", err
+	}
+
+	downloadURL := stateVersionData["data"].(map[string]interface{})["attributes"].(map[string]interface{})["hosted-state-download-url"].(string)
+
+	return downloadURL, nil
 }
